@@ -71,7 +71,7 @@ The provider consists of two shared libraries. `libazihsm_api_native.so` (the Ru
 
 ```bash
 # 1. Build a static OpenSSL
-OPENSSL_VERSION=3.0.16
+OPENSSL_VERSION=3.0.3
 curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
     | tar xz -C /tmp
 cd /tmp/openssl-${OPENSSL_VERSION}
@@ -84,8 +84,9 @@ cd azihsm-sdk
 OPENSSL_DIR=/opt/openssl-static OPENSSL_STATIC=1 \
     cargo build -p azihsm_api_native --features mock
 
-# 3. Build the provider (links against system libssl-dev)
-cargo build -p azihsm_ossl_provider --features mock
+# 3. Build the provider with static OpenSSL
+OPENSSL_DIR=/opt/openssl-static OPENSSL_STATIC=1 \
+    cargo build -p azihsm_ossl_provider --features mock
 ```
 
 On real hardware, omit `mock` from both build commands.
