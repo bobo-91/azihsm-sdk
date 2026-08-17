@@ -168,6 +168,12 @@ pub struct McrIoctlHeader {
 #[repr(u16)]
 pub enum McrCpCmdSet {
     Generic = 0,
+    /// Large-Data-Transfer command set (Martichoras PR #16771989).
+    /// When set, driver + firmware interpret the SQE's `src_data`
+    /// union as `metadata_with_session` and DMA-read the
+    /// Metadata Page. Matches `CP_CMD_SET_DATA_XFER` in the driver
+    /// UAPI (`azihsm_hsm_dev_ioctl.h`).
+    DataXfer = 1,
 }
 
 #[bitfield(u8)]
@@ -274,6 +280,92 @@ ioctl_readwrite!(
     MCR_HSM_IOC_MAGIC,
     MCR_HSM_IOC_SEQ,
     McrCpGenericCmd
+);
+
+// The driver takes a list of {user_vaddr, xfer_length} pairs, pins the
+// user pages, builds one NVMe SGL segment per buffer, then builds a
+// 4 KB Metadata Page whose {u32 xfer_length, u32 rsvd, u64 sgl_paddr}
+// entries point at those segments. The device DMA-reads the Metadata
+// Page from `metadata_page_addr` in the SQE's `metadata_with_session`
+// src_data variant. All of that is kernel-side — userland just
+// hands over the buffer list.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Maximum number of buffers per data-transfer ioctl (matches
+/// `AZIHSM_MAX_DATA_XFER_BUFFERS` in `azihsm_hsm_dev_ioctl.h`).
+pub const AZIHSM_MAX_DATA_XFER_BUFFERS: usize = 16;
+
+/// Maximum per-buffer transfer length (matches
+/// `AZIHSM_MAX_DATA_XFER_PER_BUFFER` in `azihsm_hsm_dev_ioctl.h`).
+pub const AZIHSM_MAX_DATA_XFER_PER_BUFFER: u32 = 64 * 1024;
+
+/// One `{xfer_length, buf_addr}` slot passed to the driver — kernel
+/// walks the buffer, pins pages, builds an SGL segment for it.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AziHsmDataxferBufferSlot {
+    xfer_length: u32,
+    buf_addr: *const u8,
+}
+
+impl Default for AziHsmDataxferBufferSlot {
+    fn default() -> Self {
+        Self {
+            xfer_length: 0,
+            buf_addr: std::ptr::null(),
+        }
+    }
+}
+
+/// Full `azi_hsm_dataxfer_buffers` structure passed to the driver.
+///
+/// Layout (must be byte-identical to the C UAPI):
+/// ```text
+///   u32                          buffer_cnt
+///   [{u32, *u8}; 16]             buffers
+///   [u32; 128]                   rsvd (padding for forward compat)
+/// ```
+#[repr(C)]
+pub struct AziHsmDataxferBuffers {
+    buffer_cnt: u32,
+    buffers: [AziHsmDataxferBufferSlot; AZIHSM_MAX_DATA_XFER_BUFFERS],
+    rsvd: [u32; 128],
+}
+
+impl Default for AziHsmDataxferBuffers {
+    fn default() -> Self {
+        Self {
+            buffer_cnt: 0,
+            buffers: [AziHsmDataxferBufferSlot::default(); AZIHSM_MAX_DATA_XFER_BUFFERS],
+            rsvd: [0u32; 128],
+        }
+    }
+}
+
+/// Wrapper matching `struct azihsm_ctrl_data_xfer_cmd` — the ioctl
+/// buffer for `AZIHSM_CTRL_PATH_DATA_XFER`.
+#[repr(C)]
+#[derive(Default)]
+pub struct McrCpDataXferCmd {
+    generic_cmd: McrCpGenericCmd,
+    dataxfer_buffers: AziHsmDataxferBuffers,
+}
+
+/// `set` field value that signals the driver + firmware to treat the
+/// SQE's `src_data` union as `metadata_with_session` and DMA-read the
+/// Metadata Page. Matches `CP_CMD_SET_DATA_XFER` in
+/// `azihsm_hsm_dev_ioctl.h`. Kept as a bare constant for anywhere
+/// that touches the wire value directly; `McrCpCmdSet::DataXfer`
+/// carries the same numeric encoding for typed code paths.
+#[allow(dead_code)]
+const CP_CMD_SET_DATA_XFER: u16 = 0x1;
+
+const MCR_HSM_IOC_SEQ_DATA_XFER: u8 = 0x07;
+ioctl_readwrite!(
+    azihsm_ctrl_path_data_xfer,
+    MCR_HSM_IOC_MAGIC,
+    MCR_HSM_IOC_SEQ_DATA_XFER,
+    McrCpDataXferCmd
 );
 
 // Fast path ioctl definitions and structures
@@ -905,14 +997,24 @@ impl DdiDev for DdiNixDev {
         /// TBOR dispatcher (see `fw/core/lib/src/op.rs::OP_TBOR`).
         const OP_TBOR: u16 = 2;
 
-        // The nix backend does not (yet) forward out-of-band items as
-        // SGL Data Block descriptors. Reject non-empty `oob_items`
-        // loudly rather than silently dropping payloads — any TBOR
-        // opcode that needs OOB data would otherwise misbehave in a
-        // hard-to-diagnose way.
-        if oob_items.is_some_and(|items| !items.is_empty()) {
+        // Determine whether this TBOR call needs to route through
+        // the driver's Large-Data-Transfer path.
+        // When `oob_items` is Some(non-empty), the driver
+        // pins those user buffers, builds per-buffer NVMe SGL
+        // segments, and attaches a 4 KB Metadata Page — reported to
+        // firmware via `sqe.src_data.metadata_with_session
+        // .metadata_page_addr` and gated by
+        // `sqe.cmd.set == CP_CMD_SET_DATA_XFER (0x1)`.
+        let oob_slice: &[&[u8]] = oob_items.unwrap_or(&[]);
+        if oob_slice.len() > AZIHSM_MAX_DATA_XFER_BUFFERS {
             return Err(DdiError::InvalidParameter);
         }
+        for item in oob_slice.iter() {
+            if item.len() as u64 > AZIHSM_MAX_DATA_XFER_PER_BUFFER as u64 {
+                return Err(DdiError::InvalidParameter);
+            }
+        }
+        let use_data_xfer = !oob_slice.is_empty();
 
         const REQ_BUF_LEN: usize = 8192;
         const RESP_BUF_LEN: usize = 8192;
@@ -929,46 +1031,98 @@ impl DdiDev for DdiNixDev {
 
         let mut resp_buf = Box::<[u8; RESP_BUF_LEN]>::new([0u8; RESP_BUF_LEN]);
 
-        // ── 2. Build the ioctl command ───────────────────────────
-        let mut cmd = McrCpGenericCmd::default();
-        cmd.hdr.ioctl_data_size = mem::size_of::<McrCpGenericCmd>() as u32;
-        cmd.hdr.app_cmd_id = 0xCD1DDEAD;
-        cmd.hdr.timeout = 100; // ms
+        // ── 2. Build the ioctl command (populate the shared
+        //       McrCpGenericCmd payload; may be wrapped in
+        //       McrCpDataXferCmd below). ─────────────────────────
+        let mut inner = McrCpGenericCmd::default();
+        inner.hdr.app_cmd_id = 0xCD1DDEAD;
+        inner.hdr.timeout = 100; // ms
 
         // The Rust field `rsvd1` aliases the C UAPI `__u16 opc` field
         // (see drivers/linux/drvsrc/azihsm_hsm_dev_ioctl.h). Writing
         // OP_TBOR here is THE flag the firmware uses to route the
         // request through `handle_tbor_op` instead of `handle_mbor_op`.
-        cmd.in_data.rsvd1 = OP_TBOR;
-        cmd.in_data.command_set = McrCpCmdSet::Generic;
+        inner.in_data.rsvd1 = OP_TBOR;
+        // `command_set` (`sqe.cmd.set` on the wire) selects between
+        // the legacy session flow (`Generic == 0x0`) and the new
+        // Large-Data-Transfer flow (`0x1`). Firmware uses this to
+        // decide whether to parse `src_data` as `metadata_with_session`.
+        inner.in_data.command_set = if use_data_xfer {
+            McrCpCmdSet::DataXfer
+        } else {
+            McrCpCmdSet::Generic
+        };
 
         // Session control flags come from the TBOR request type.
         let session_ctrl = req.session_ctrl();
-        cmd.in_data
+        inner
+            .in_data
             .session_control_flags
             .set_kind(u8::from(session_ctrl));
         if let Some(sid) = req.get_session_id() {
-            cmd.in_data.session_id = sid;
-            cmd.in_data
+            inner.in_data.session_id = sid;
+            inner
+                .in_data
                 .session_control_flags
                 .set_session_id_is_valid(true);
         }
 
-        cmd.in_data.src_length = req_len as u32;
-        cmd.in_data.src_buf = req_buf.as_ptr();
-        cmd.in_data.dst_length = resp_buf.len() as u32;
-        cmd.in_data.dst_buf = resp_buf.as_mut_ptr();
+        inner.in_data.src_length = req_len as u32;
+        inner.in_data.src_buf = req_buf.as_ptr();
+        inner.in_data.dst_length = resp_buf.len() as u32;
+        inner.in_data.dst_buf = resp_buf.as_mut_ptr();
 
         // ── 3. Issue the ioctl ───────────────────────────────────
         // SAFETY: src/dst pointers above are valid for the duration
-        // of the ioctl call; the buffers outlive `cmd`.
-        let res = unsafe { mcr_ctrl_cmd_generic_ioctl(self.file.read().as_raw_fd(), &mut cmd) };
-        if res.is_err() {
-            self.map_ioctl_status_tbor(cmd.out_data.ioctl_status)?;
-            res.map_err(DdiError::NixError)?;
-        }
-        if cmd.out_data.status != 0 {
-            return Err(DdiError::DdiError(cmd.out_data.status));
+        // of the ioctl call; the buffers outlive `cmd`. When
+        // `use_data_xfer`, oob_slice entries must outlive the ioctl
+        // too — they do: they are borrowed for the entire fn.
+        let (status, ioctl_status, byte_count) = if use_data_xfer {
+            let mut cmd = McrCpDataXferCmd {
+                generic_cmd: inner,
+                ..Default::default()
+            };
+            cmd.generic_cmd.hdr.ioctl_data_size = mem::size_of::<McrCpDataXferCmd>() as u32;
+            cmd.dataxfer_buffers.buffer_cnt = oob_slice.len() as u32;
+            for (i, item) in oob_slice.iter().enumerate() {
+                cmd.dataxfer_buffers.buffers[i] = AziHsmDataxferBufferSlot {
+                    xfer_length: item.len() as u32,
+                    buf_addr: item.as_ptr(),
+                };
+            }
+            // SAFETY: `cmd` is a valid, initialized ioctl buffer for
+            // AZIHSM_CTRL_PATH_DATA_XFER; the file descriptor is
+            // guaranteed open for the duration of the call.
+            let res = unsafe { azihsm_ctrl_path_data_xfer(self.file.read().as_raw_fd(), &mut cmd) };
+            if res.is_err() {
+                self.map_ioctl_status_tbor(cmd.generic_cmd.out_data.ioctl_status)?;
+                res.map_err(DdiError::NixError)?;
+            }
+            (
+                cmd.generic_cmd.out_data.status,
+                cmd.generic_cmd.out_data.ioctl_status,
+                cmd.generic_cmd.out_data.byte_count,
+            )
+        } else {
+            let mut cmd = inner;
+            cmd.hdr.ioctl_data_size = mem::size_of::<McrCpGenericCmd>() as u32;
+            // SAFETY: `cmd` is a valid, initialized ioctl buffer for
+            // the legacy generic ioctl; the file descriptor is
+            // guaranteed open for the duration of the call.
+            let res = unsafe { mcr_ctrl_cmd_generic_ioctl(self.file.read().as_raw_fd(), &mut cmd) };
+            if res.is_err() {
+                self.map_ioctl_status_tbor(cmd.out_data.ioctl_status)?;
+                res.map_err(DdiError::NixError)?;
+            }
+            (
+                cmd.out_data.status,
+                cmd.out_data.ioctl_status,
+                cmd.out_data.byte_count,
+            )
+        };
+        let _ = ioctl_status;
+        if status != 0 {
+            return Err(DdiError::DdiError(status));
         }
 
         // ── 4. Decode the typed response ─────────────────────────
@@ -976,7 +1130,7 @@ impl DdiDev for DdiNixDev {
         // therefore across a trust boundary — clamp it against the
         // allocated response buffer before indexing to avoid a
         // host-side panic on a bogus device value.
-        let resp_len = cmd.out_data.byte_count as usize;
+        let resp_len = byte_count as usize;
         if resp_len > RESP_BUF_LEN {
             return Err(DdiError::InvalidParameter);
         }

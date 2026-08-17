@@ -29,6 +29,7 @@ pub mod psk_change;
 pub mod rsa_mod_exp;
 pub mod sd_create_peer_backup;
 pub mod sd_create_remote_backup;
+pub mod sd_create_remote_backup_hw_sgl;
 pub mod sd_reseal_remote_backup;
 pub mod sd_restore_local_backup;
 pub mod sd_restore_peer_backup;
